@@ -1,0 +1,12 @@
+config BR2_PACKAGE_KMOD_CSDIO
+	bool "CSDIO driver"
+	help
+	  Char SDIO driver
+
+config CSDIO_VID
+  hex "Vendor ID"
+  default 0x024c
+
+config CSDIO_PID
+  hex "Device ID"
+  default 0xb852
