@@ -55,7 +55,7 @@ static bool g_csdio_initialized = false;
 
 struct csdio_func_t {
   struct sdio_func *m_func;
-  u8 block_size;
+  u16 block_size;
   struct cdev m_cdev; 
   struct device *m_device;
   struct csdio_card *card;
@@ -68,7 +68,7 @@ struct csdio_func_t {
 };
 
 struct csdio_card {
-  struct mmc_host *host;
+  struct mmc_card *mmc_card;
   struct cdev m_cdev;
   struct device *m_device;
   char devname[16];
@@ -200,9 +200,10 @@ struct csdio_t {
                           " size to %d failed (%d)\n",
               sdio_func->num, block_size, ret);
        ret = -ENOTTY;
-       break;
      }
-      csdio_func->block_size = block_size; 
+      else{
+        csdio_func->block_size = block_size; 
+      }
      mutex_unlock(&csdio_func->lock);
    } break;
    case CSDIO_IOC_CMD52: {
@@ -236,9 +237,9 @@ struct csdio_t {
               sdio_func->num);
        ret = -EFAULT;
      }
- 
    } break;
    case CSDIO_IOC_CMD53: {
+     u16 block_size;
      struct csdio_cmd53_ctrl_t csdio_cmd53_ctrl;
      unsigned long uncopied_bytes;
      size_t byte_count;
@@ -252,9 +253,10 @@ struct csdio_t {
        break;
      }
      mutex_lock(&csdio_func->lock);
+      block_size = csdio_func->block_size;
 
      if (csdio_cmd53_ctrl.m_block_mode) {
-       byte_count = csdio_func->block_size * csdio_cmd53_ctrl.m_byte_block_count;
+       byte_count = block_size * csdio_cmd53_ctrl.m_byte_block_count;
      }
      else{
          byte_count = csdio_cmd53_ctrl.m_byte_block_count;
@@ -275,10 +277,13 @@ struct csdio_t {
 
             mutex_unlock(&csdio_func->lock);
              ret = -EFAULT;
+            break;
          }
      }
  
      sdio_claim_host(sdio_func);
+
+      mutex_unlock(&csdio_func->lock);
  
      if (csdio_cmd53_ctrl.m_op_code) {
        if(csdio_cmd53_ctrl.m_write){
@@ -312,7 +317,6 @@ struct csdio_t {
            ret = -EFAULT;
          }
      }   
-     mutex_unlock(&csdio_func->lock);
    } break;
    case CSDIO_IOC_CONNECT_ISR: {
  
@@ -401,8 +405,7 @@ struct csdio_t {
 // #endif
 
 static void csdio_cdev_deinit(struct cdev *char_dev,
-                              int dev_minor,
-                              const char *devname)
+                              int dev_minor)
 {
     dev_t devno;
 
@@ -479,8 +482,8 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
     struct sdio_func	*sdio_func_1;
 
     csdio_card = filp->private_data;
-    mmc_host = csdio_card->host; 
-    mmc_card = mmc_host->card;
+    mmc_card = csdio_card->mmc_card;
+    mmc_host = mmc_card->host; 
     sdio_func_1 = mmc_card->sdio_func[0];
 
    pr_info("CSDIO ctrl ioctl.\n");
@@ -607,7 +610,7 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
 
  static void csdio_func_dealloc(struct csdio_func_t *csdio_func){
     pr_err(CSDIO_DEV_NAME": /dev/%s removed\n", csdio_func->devname);
-    csdio_cdev_deinit(&csdio_func->m_cdev, csdio_func->minor, CSDIO_DEV_NAME);
+    csdio_cdev_deinit(&csdio_func->m_cdev, csdio_func->minor);
     csdio_func->card->nb_functions--;
     kfree(csdio_func->sdio_buffer);
     kfree(csdio_func);
@@ -616,7 +619,7 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
 static void csdio_card_dealloc(struct csdio_card *csdio_card)
 {
     pr_err(CSDIO_DEV_NAME": /dev/%s removed\n", csdio_card->devname);
-    csdio_cdev_deinit(&csdio_card->m_cdev, csdio_card->minor, CSDIO_DEV_NAME);
+    csdio_cdev_deinit(&csdio_card->m_cdev, csdio_card->minor);
     kfree(csdio_card);
 }
 
@@ -668,11 +671,12 @@ static int csdio_func_alloc(struct csdio_func_t **csdio_func,struct csdio_card* 
     kfree(new_csdio_func->sdio_buffer);
   deallocate_csdio_func:
     kfree(new_csdio_func);
+    *csdio_func = NULL;
   exit:
     return ret;
 }
 
-static int csdio_card_alloc(struct csdio_card **csdio_card, struct mmc_host *host, int minor, int card_no){
+static int csdio_card_alloc(struct csdio_card **csdio_card, struct mmc_card *mmc_card, int minor, int card_no){
   int ret;
 
   struct csdio_card* new_csdio_card = kzalloc(sizeof(struct csdio_card), GFP_KERNEL);
@@ -687,13 +691,13 @@ static int csdio_card_alloc(struct csdio_card **csdio_card, struct mmc_host *hos
 
 
    if((ret = csdio_cdev_init(&new_csdio_card->m_cdev, &new_csdio_card->m_device, &csdio_ctrl_fops,
-                                            minor, new_csdio_card->devname, NULL))){
+                                            minor, new_csdio_card->devname, &mmc_card->dev))){
     pr_err(CSDIO_DEV_NAME ": can't initialize csdio card cdev: %s%d\n", CSDIO_DEV_NAME, new_csdio_card->card_no);
     ret = -ENOENT;
     goto free_csdio_card;
   }
 
-  new_csdio_card->host = host;
+  new_csdio_card->mmc_card = mmc_card;
   new_csdio_card->minor = minor;
   new_csdio_card->card_no = card_no;
   new_csdio_card->nb_functions= 0;
@@ -705,6 +709,7 @@ static int csdio_card_alloc(struct csdio_card **csdio_card, struct mmc_host *hos
 
   free_csdio_card:
     kfree(new_csdio_card);
+    *csdio_card = NULL;
   exit:
     return ret;
 }
@@ -731,7 +736,7 @@ static struct csdio_card* get_csdio_card_from_mmc_card(struct mmc_card* mmc_card
 static int csdio_probe(struct sdio_func *sdio_func,
                        const struct sdio_device_id *id) {
   struct csdio_func_t *csdio_func;
-  struct mmc_host *mmc_host;
+  struct mmc_card *mmc_card;
   struct csdio_card* csdio_card;
   int new_csdio_card_minor;
   int new_csdio_card_id;
@@ -746,19 +751,18 @@ static int csdio_probe(struct sdio_func *sdio_func,
   }
   else{
     new_card = true;
-    mmc_host = sdio_func->card->host;
+    mmc_card = sdio_func->card;
     new_csdio_card_minor = ida_alloc_range(&g_csdio.minor_ida,
                                             0, CSDIO_MAX_DEVICES, GFP_KERNEL);
     new_csdio_card_id = ida_alloc_range(&g_csdio.registered_cards_ida,
                                             0, CSDIO_MAX_CARDS, GFP_KERNEL);
-    if ((ret = csdio_card_alloc(&csdio_card, mmc_host, new_csdio_card_minor, new_csdio_card_id))){
+    if ((ret = csdio_card_alloc(&csdio_card, mmc_card, new_csdio_card_minor, new_csdio_card_id))){
       goto dealloc_csdio_card_ida;
     }
   }
 
-  // Allow RW operations on on any field of the CCR region 
+  // Allow RW operations on any field of the CCR region 
   sdio_func->card->quirks |= MMC_QUIRK_LENIENT_FN0;
-
 
   new_csdio_func_minor = ida_alloc_range(&g_csdio.minor_ida,
                                         0, CSDIO_MAX_DEVICES, GFP_KERNEL);
@@ -770,11 +774,14 @@ static int csdio_probe(struct sdio_func *sdio_func,
   goto exit;
 
   dealloc_csdio_card:
-  if(new_card) csdio_card_dealloc(csdio_card);
   ida_free(&g_csdio.minor_ida, new_csdio_func_minor);
+  if(new_card)
+    csdio_card_dealloc(csdio_card);
   dealloc_csdio_card_ida:
+  if(new_card){
     ida_free(&g_csdio.registered_cards_ida, new_csdio_card_id);
     ida_free(&g_csdio.minor_ida, new_csdio_card_minor);
+  }
   exit:
     return ret;
 }
