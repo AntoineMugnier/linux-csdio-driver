@@ -94,12 +94,6 @@ struct csdio_t {
 
    struct sdio_func *sdio_func;
  
-  if (!try_module_get(THIS_MODULE)) {
-    pr_err(CSDIO_DEV_NAME ": can't get module refcount when opening csdio function file\n");
-    ret =  -ENODEV;
-    goto exit;
-  }
-
    csdio_func = container_of(inode->i_cdev, struct csdio_func_t, m_cdev);
    sdio_func = csdio_func->m_func;
 
@@ -111,20 +105,18 @@ struct csdio_t {
     if (ret) {
       pr_err(CSDIO_DEV_NAME": Cannot enable function %d when closing /dev/%s\n", sdio_func->num, csdio_func->devname);
       ret = -EIO;
-      module_put(THIS_MODULE); 
-      goto release_host;
+      sdio_release_host(sdio_func);
+      mutex_unlock(&csdio_func->lock);
+      return ret;
     }
    }
+    csdio_func->open_count++;
+    filp->private_data = csdio_func;
+    pr_info(CSDIO_DEV_NAME": open csdio function: /dev/%s\n", csdio_func->devname);
 
-  csdio_func->open_count++;
-  filp->private_data = csdio_func;
-  pr_info(CSDIO_DEV_NAME": open csdio function: /dev/%s\n", csdio_func->devname);
-
-release_host:
    sdio_release_host(sdio_func);
    mutex_unlock(&csdio_func->lock);
-exit:
-   return ret;
+    return ret;
  }
  
  static int csdio_transport_fasync(int fd, struct file *filp, int mode) {
@@ -158,8 +150,8 @@ exit:
       }
       csdio_transport_fasync(-1, filp, 0);
     }
+
    mutex_unlock(&csdio_func->lock);
-   module_put(THIS_MODULE); 
    pr_info(CSDIO_DEV_NAME": close csdio function %d : /dev/%s\n",  sdio_func->num, csdio_func->devname);
    return ret;
  }
@@ -259,7 +251,6 @@ exit:
               sdio_func->num);
        break;
      }
-
      mutex_lock(&csdio_func->lock);
 
      if (csdio_cmd53_ctrl.m_block_mode) {
@@ -268,11 +259,21 @@ exit:
      else{
          byte_count = csdio_cmd53_ctrl.m_byte_block_count;
      }
- 
+
+     if(byte_count > CSDIO_SDIO_BUFFER_SIZE){
+
+        pr_err(TP_DEV_NAME ": Request transfer of %lu bytes excesses max size of %d bytes", byte_count, CSDIO_SDIO_BUFFER_SIZE);
+        mutex_unlock(&csdio_func->lock);
+        ret = -EINVAL;
+        break;
+      } 
+
      if(csdio_cmd53_ctrl.m_write){
          if( (uncopied_bytes = copy_from_user(csdio_func->sdio_buffer, csdio_cmd53_ctrl.m_data, byte_count))){
             pr_err(TP_DEV_NAME "F%d:"
                                 "CMD53 could not copy remaining %lu bytes of CMD53 data !\n", sdio_func->num, uncopied_bytes);
+
+            mutex_unlock(&csdio_func->lock);
              ret = -EFAULT;
          }
      }
@@ -418,13 +419,14 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
 }
 
  static int csdio_cdev_init(struct cdev *char_dev,
-                                        struct device *device,
+                                        struct device **device,
                                        const struct file_operations *file_op,
                                        int dev_minor, const char *devname,
                                        struct device *parent) {
    int ret = 0;
    int devno = MKDEV(g_csdio.csdio_major, dev_minor);
- 
+    struct device *new_device;
+
    cdev_init(char_dev, file_op);
    char_dev->owner = THIS_MODULE;
    ret = cdev_add(char_dev, devno, 1);
@@ -435,9 +437,9 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
      goto exit;
    }
  
-   device = device_create(g_csdio.m_driver_class, parent, devno, NULL,
+   new_device = device_create(g_csdio.m_driver_class, parent, devno, NULL,
                               devname);
-   if (!device) {
+   if (IS_ERR(new_device)) {
      pr_err(CSDIO_DEV_NAME ": can't create device node %s%d\n", devname, dev_minor);
      goto cleanup;
    }
@@ -449,7 +451,7 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
    // }
  
    pr_info(CSDIO_DEV_NAME ": device node '/dev/%s' created successfully\n", devname);
-
+  *device = new_device;
    goto exit;
  cleanup:
    cdev_del(char_dev);
@@ -581,16 +583,9 @@ static void csdio_cdev_deinit(struct cdev *char_dev,
    int ret = 0;
    struct csdio_card *csdio_card; /*  device information */
  
-  if (!try_module_get(THIS_MODULE)) {
-      pr_err(CSDIO_DEV_NAME ": can't get module refcount when opening sdio card file\n");
-      ret =  -ENODEV;
-    goto exit;
-  }
-
   csdio_card = container_of(inode->i_cdev, struct csdio_card, m_cdev);
   pr_info(CSDIO_DEV_NAME ": open file %s", csdio_card->devname);
   filp->private_data = csdio_card; /*  for other methods */
-exit:
    return ret;
  }
  
@@ -599,7 +594,7 @@ exit:
   csdio_card = container_of(inode->i_cdev, struct csdio_card, m_cdev);
 
     pr_info(CSDIO_DEV_NAME ": close file %s", csdio_card->devname);
-   module_put(THIS_MODULE); 
+   //module_put(THIS_MODULE); 
    return 0;
  }
  
@@ -611,6 +606,7 @@ exit:
  };
 
  static void csdio_func_dealloc(struct csdio_func_t *csdio_func){
+    pr_err(CSDIO_DEV_NAME": /dev/%s removed\n", csdio_func->devname);
     csdio_cdev_deinit(&csdio_func->m_cdev, csdio_func->minor, CSDIO_DEV_NAME);
     csdio_func->card->nb_functions--;
     kfree(csdio_func->sdio_buffer);
@@ -619,8 +615,8 @@ exit:
 
 static void csdio_card_dealloc(struct csdio_card *csdio_card)
 {
+    pr_err(CSDIO_DEV_NAME": /dev/%s removed\n", csdio_card->devname);
     csdio_cdev_deinit(&csdio_card->m_cdev, csdio_card->minor, CSDIO_DEV_NAME);
-    ida_free(&g_csdio.registered_cards_ida,csdio_card->card_no);
     kfree(csdio_card);
 }
 
@@ -649,7 +645,7 @@ static int csdio_func_alloc(struct csdio_func_t **csdio_func,struct csdio_card* 
 
   scnprintf(new_csdio_func->devname, sizeof(new_csdio_func->devname), "%s%d%s%d", CSDIO_DEV_NAME, csdio_card->card_no, "f", sdio_func->num);
 
-  if ((ret = csdio_cdev_init(&new_csdio_func->m_cdev, new_csdio_func->m_device, &csdio_transport_fops,
+  if ((ret = csdio_cdev_init(&new_csdio_func->m_cdev, &new_csdio_func->m_device, &csdio_transport_fops,
                                 minor, new_csdio_func->devname,
                                 &sdio_func->dev))){
 
@@ -690,7 +686,7 @@ static int csdio_card_alloc(struct csdio_card **csdio_card, struct mmc_host *hos
   scnprintf(new_csdio_card->devname, sizeof(new_csdio_card->devname), "%s%d", CSDIO_DEV_NAME, card_no);
 
 
-   if((ret = csdio_cdev_init(&new_csdio_card->m_cdev, new_csdio_card->m_device, &csdio_ctrl_fops,
+   if((ret = csdio_cdev_init(&new_csdio_card->m_cdev, &new_csdio_card->m_device, &csdio_ctrl_fops,
                                             minor, new_csdio_card->devname, NULL))){
     pr_err(CSDIO_DEV_NAME ": can't initialize csdio card cdev: %s%d\n", CSDIO_DEV_NAME, new_csdio_card->card_no);
     ret = -ENOENT;
@@ -750,12 +746,13 @@ static int csdio_probe(struct sdio_func *sdio_func,
   }
   else{
     new_card = true;
-    new_csdio_card_minor = ida_simple_get(&g_csdio.minor_ida,
+    mmc_host = sdio_func->card->host;
+    new_csdio_card_minor = ida_alloc_range(&g_csdio.minor_ida,
                                             0, CSDIO_MAX_DEVICES, GFP_KERNEL);
-    new_csdio_card_id = ida_simple_get(&g_csdio.registered_cards_ida,
+    new_csdio_card_id = ida_alloc_range(&g_csdio.registered_cards_ida,
                                             0, CSDIO_MAX_CARDS, GFP_KERNEL);
     if ((ret = csdio_card_alloc(&csdio_card, mmc_host, new_csdio_card_minor, new_csdio_card_id))){
-      goto exit;
+      goto dealloc_csdio_card_ida;
     }
   }
 
@@ -763,7 +760,7 @@ static int csdio_probe(struct sdio_func *sdio_func,
   sdio_func->card->quirks |= MMC_QUIRK_LENIENT_FN0;
 
 
-  new_csdio_func_minor = ida_simple_get(&g_csdio.minor_ida,
+  new_csdio_func_minor = ida_alloc_range(&g_csdio.minor_ida,
                                         0, CSDIO_MAX_DEVICES, GFP_KERNEL);
 
   if ((ret = csdio_func_alloc(&csdio_func, csdio_card, sdio_func, new_csdio_func_minor))){
@@ -773,7 +770,11 @@ static int csdio_probe(struct sdio_func *sdio_func,
   goto exit;
 
   dealloc_csdio_card:
-    if(new_card) csdio_card_dealloc(csdio_card);
+  if(new_card) csdio_card_dealloc(csdio_card);
+  ida_free(&g_csdio.minor_ida, new_csdio_func_minor);
+  dealloc_csdio_card_ida:
+    ida_free(&g_csdio.registered_cards_ida, new_csdio_card_id);
+    ida_free(&g_csdio.minor_ida, new_csdio_card_minor);
   exit:
     return ret;
 }
@@ -781,11 +782,11 @@ static int csdio_probe(struct sdio_func *sdio_func,
 static void csdio_remove(struct sdio_func *sdio_func) {
   struct csdio_card* csdio_card;
   struct csdio_func_t *csdio_func = sdio_get_drvdata(sdio_func);
-  
   csdio_card = csdio_func->card;
   csdio_func_dealloc(csdio_func);
 
   if(csdio_card->nb_functions == 0){
+    ida_free(&g_csdio.registered_cards_ida, csdio_card->card_no);
     csdio_card_dealloc(csdio_card);
   }
 }
