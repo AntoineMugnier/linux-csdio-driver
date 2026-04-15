@@ -253,7 +253,7 @@ struct csdio_t {
        break;
      }
      mutex_lock(&csdio_func->lock);
-      block_size = csdio_func->block_size;
+     block_size = csdio_func->block_size;
 
      if (csdio_cmd53_ctrl.m_block_mode) {
        byte_count = block_size * csdio_cmd53_ctrl.m_byte_block_count;
@@ -320,16 +320,12 @@ struct csdio_t {
    } break;
    case CSDIO_IOC_CONNECT_ISR: {
  
-     sdio_claim_host(sdio_func);
      ret = sdio_claim_irq(sdio_func, csdio_sdio_irq);
-     sdio_release_host(sdio_func);
      if (ret) {
        pr_err(CSDIO_DEV_NAME " SDIO_CONNECT_ISR"
                              " claim irq failed(%d)\n",
               ret);
      } else {
-       /* update current irq mask for disable/enable */
-       //g_csdio.m_current_irq_mask |= (1 << sdio_func->num);
      }
    } break;
    case CSDIO_IOC_DISCONNECT_ISR: {
